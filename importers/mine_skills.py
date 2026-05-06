@@ -35,6 +35,19 @@ ROOTS = [
     (Path.home() / ".claude" / "plugins" / "cache", "plugin"),
 ]
 
+# Slash command roots. Slugs get `cmd:` prefix to avoid collisions with skills
+# of the same name (e.g. /grc-weekly command + grc-weekly SKILL.md). Tagged
+# `kind:command` so callers can filter via skills_list(tag='kind:command').
+COMMAND_ROOTS = [
+    (Path.home() / ".claude" / "commands", "user"),
+]
+
+# Plugin sources whose skills are off-topic for this user (FedRAMP/infra/security).
+# Override with --include-excluded if you ever want them back.
+EXCLUDED_TAG_PREFIXES = (
+    "plugin:knowledge-work-plugins",
+)
+
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 def parse_frontmatter(text: str):
@@ -77,6 +90,15 @@ def find_skill_files():
             slug = skill_md.parent.name
             yield slug, skill_md, origin_tag(skill_md, label)
 
+def find_command_files():
+    """Yield (slug, path, origin_tag) for each slash command markdown file."""
+    for root, label in COMMAND_ROOTS:
+        if not root.exists():
+            continue
+        for cmd_md in root.glob("*.md"):
+            slug = f"cmd:{cmd_md.stem}"
+            yield slug, cmd_md, label
+
 def mcp_upsert(payload, dry_run=False):
     if dry_run:
         return {"dry_run": True, "slug": payload["slug"], "tags": payload["tags"]}
@@ -105,41 +127,67 @@ def mcp_upsert(payload, dry_run=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--include-excluded", action="store_true",
+                    help="Bypass EXCLUDED_TAG_PREFIXES filter (off-topic plugin skills).")
     args = ap.parse_args()
 
     seen = {}
     skipped = []
-    for slug, path, tag in find_skill_files():
-        if slug in seen:
-            skipped.append((slug, path, "dupe"))
-            continue
-        try:
-            text = path.read_text()
-        except Exception as e:
-            skipped.append((slug, path, f"read-error: {e}"))
-            continue
-        front, body = parse_frontmatter(text)
-        name = front.get("name") or slug
-        description = front.get("description") or front.get("summary") or f"{slug} skill"
-        existing_tags = []
-        if "tags" in front:
-            tag_str = front["tags"].strip("[]")
-            existing_tags = [t.strip().strip("'\"") for t in tag_str.split(",") if t.strip()]
-        tags = list({tag, *existing_tags})
-        if not body.strip():
-            skipped.append((slug, path, "empty-body"))
-            continue
-        seen[slug] = (path, tag)
-        payload = {
-            "slug": slug,
-            "name": name[:200],
-            "description": description[:1000],
-            "generic_body": body,
-            "tags": tags,
-        }
-        result = mcp_upsert(payload, dry_run=args.dry_run)
-        marker = "DRY" if args.dry_run else "UPSERT"
-        print(f"[{marker}] {slug:40s} ({tag:20s}) [{len(body):>5}b] tags={tags}")
+
+    sources = [
+        (find_skill_files(), "skill", False),
+        (find_command_files(), "command", True),
+    ]
+
+    for source_iter, kind, is_command in sources:
+        for slug, path, tag in source_iter:
+            if slug in seen:
+                skipped.append((slug, path, "dupe"))
+                continue
+            if not args.include_excluded and any(tag.startswith(p) for p in EXCLUDED_TAG_PREFIXES):
+                skipped.append((slug, path, f"excluded:{tag}"))
+                continue
+            try:
+                text = path.read_text()
+            except Exception as e:
+                skipped.append((slug, path, f"read-error: {e}"))
+                continue
+            front, body = parse_frontmatter(text)
+
+            if is_command:
+                # Slash commands are flat .md files without frontmatter.
+                # Description = first non-empty line; name humanizes the slug.
+                desc_line = next(
+                    (ln.strip() for ln in body.splitlines() if ln.strip()),
+                    f"slash command /{path.stem}",
+                )
+                name = path.stem
+                description = desc_line.lstrip("# ").strip()
+                tags = [tag, "kind:command"]
+            else:
+                name = front.get("name") or slug
+                description = front.get("description") or front.get("summary") or f"{slug} skill"
+                existing_tags = []
+                if "tags" in front:
+                    tag_str = front["tags"].strip("[]")
+                    existing_tags = [t.strip().strip("'\"") for t in tag_str.split(",") if t.strip()]
+                tags = list({tag, *existing_tags})
+
+            if not body.strip():
+                skipped.append((slug, path, "empty-body"))
+                continue
+            seen[slug] = (path, tag)
+            payload = {
+                "slug": slug,
+                "name": name[:200],
+                "description": description[:1000],
+                "generic_body": body,
+                "tags": tags,
+            }
+            mcp_upsert(payload, dry_run=args.dry_run)
+            marker = "DRY" if args.dry_run else "UPSERT"
+            kind_label = "cmd" if is_command else "skl"
+            print(f"[{marker}:{kind_label}] {slug:40s} ({tag:20s}) [{len(body):>5}b] tags={tags}")
 
     print()
     print(f"Imported: {len(seen)}")

@@ -614,6 +614,47 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "skill_variant_upsert",
+  {
+    title: "Upsert Skill Variant",
+    description:
+      "Create or update a vendor-specific variant of a skill. Use this to layer LLM-specific guidance (Claude Code, Codex, Gemini, mobile) on top of a vendor-agnostic generic_body. Mode 'extend' appends variant body to generic_body; mode 'replace' substitutes it entirely. The skill must already exist (call skill_upsert first).",
+    inputSchema: {
+      slug: z.string().describe("The parent skill slug (must already exist in skills table)"),
+      vendor: z.string().describe("'claude' | 'codex' | 'gemini' | 'openclaw' | 'local'"),
+      body: z.string().describe("The vendor-specific guidance"),
+      mode: z.enum(["replace", "extend"]).optional().describe("Default 'extend' — variant text appended to generic_body. Use 'replace' for fully separate vendor implementations."),
+    },
+  },
+  async ({ slug, vendor, body, mode }) => {
+    try {
+      const { data: skill, error: skillErr } = await supabase
+        .from("skills").select("id").eq("slug", slug).maybeSingle();
+      if (skillErr) {
+        return { content: [{ type: "text" as const, text: `Error: ${skillErr.message}` }], isError: true };
+      }
+      if (!skill) {
+        return { content: [{ type: "text" as const, text: `Skill not found: ${slug}. Call skill_upsert first.` }], isError: true };
+      }
+      const { data, error } = await supabase
+        .from("skill_variants")
+        .upsert(
+          { skill_id: skill.id, vendor, body, mode: mode ?? "extend" },
+          { onConflict: "skill_id,vendor" }
+        )
+        .select("id, vendor, mode, version, created_at")
+        .single();
+      if (error) {
+        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {

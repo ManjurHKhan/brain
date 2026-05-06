@@ -1036,6 +1036,16 @@ create table if not exists todos (
   content text not null,
   status text not null default 'open'
     check (status in ('open','in-progress','waiting','done')),
+  -- Who/what should pick this up. Free text but conventionally one of:
+  -- 'manjur' | 'claude-code' | 'codex' | 'gemini' | 'mobile' | NULL (unassigned)
+  -- Enables cross-LLM task handoff: codex queries todo_list(assignee='codex')
+  -- at session start; claude-code can re-assign with todo_assign(id, 'codex').
+  assignee text,
+  -- Which client wrote the row. Stamped by MCP tool from auth context.
+  -- Useful for audit + "where did this come from".
+  created_by text,
+  priority text not null default 'medium'
+    check (priority in ('low','medium','high','critical')),
   context text,                              -- free-text grouping (project/area)
   due_at timestamptz,
   completed_at timestamptz,
@@ -1045,6 +1055,7 @@ create table if not exists todos (
 
 create index todos_status_idx on todos(status);
 create index todos_context_idx on todos(context);
+create index todos_assignee_idx on todos(assignee) where assignee is not null;
 
 create trigger todos_updated_at before update on todos
   for each row execute function set_updated_at();
@@ -1178,6 +1189,23 @@ curl -X POST "$BRAIN_MCP_URL" -H "Authorization: Bearer $BRAIN_CLAUDE_KEY" \
 ### Task 15: MCP tools for todos with optimistic concurrency
 
 Same pattern as Task 14 — `todoCreate`, `todoUpdate` (with `expected_updated_at`), `todoList`, `todoDone`, `todoWorking`. Register, deploy, smoke test, commit.
+
+**Cross-LLM task handoff**: `todo_create` and `todo_update` accept `assignee` ('manjur' | 'claude-code' | 'codex' | 'gemini' | 'mobile' | NULL). `todo_list` accepts `assignee` filter. Add convenience tool `todo_assign(id, assignee, expected_updated_at)` for explicit handoff.
+
+`created_by` is stamped automatically from the calling client's auth context (resolved by `lib/auth.ts` via the `client` field on the matched `api_keys` row). Don't accept it as a tool argument.
+
+Conventional vendor identifiers (used throughout the system):
+- `'manjur'` — human pick-up
+- `'claude-code'` — desktop Claude Code
+- `'codex'` — Codex CLI
+- `'gemini'` — Gemini CLI
+- `'mobile'` — Claude iOS
+- `NULL` — anyone / unassigned
+
+Use case examples:
+- Codex session start: call `todo_list(assignee='codex', status='open')` to pick up queued work.
+- Claude Code finds a low-priority TF refactor: `todo_create(content='...', assignee='codex', priority='low')` — codex picks it up later.
+- Field handoff: phone captures a thought during a meeting, creates a todo `assignee='manjur'` for follow-up.
 
 ---
 
