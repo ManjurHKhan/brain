@@ -504,6 +504,116 @@ server.registerTool(
   }
 );
 
+// --- Skills tools (added 2026-05-06) ---
+
+server.registerTool(
+  "skills_list",
+  {
+    title: "List Skills",
+    description:
+      "List skills available in the brain. Optional filter by vendor (returns has_variant flag) or by tag.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      vendor: z.string().optional().describe("'claude' | 'codex' | 'gemini' | 'openclaw' | 'local'"),
+      tag: z.string().optional(),
+    },
+  },
+  async ({ vendor, tag }) => {
+    try {
+      let q = supabase.from("skills").select("id, slug, name, description, tags");
+      if (tag) q = q.contains("tags", [tag]);
+      const { data, error } = await q.order("slug");
+      if (error) {
+        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      }
+      let skills = data ?? [];
+      if (vendor) {
+        const { data: variants } = await supabase
+          .from("skill_variants")
+          .select("skill_id")
+          .eq("vendor", vendor);
+        const variantSet = new Set((variants ?? []).map((v: { skill_id: string }) => v.skill_id));
+        skills = skills.map((s: { id: string }) => ({ ...s, has_variant: variantSet.has(s.id) }));
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(skills, null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "skill_get",
+  {
+    title: "Get Skill Body",
+    description:
+      "Resolve a skill's body for the calling vendor. If a variant exists in mode='replace', returns the variant body; if 'extend', returns generic + variant; if no variant, returns generic.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      slug: z.string(),
+      vendor: z.string().optional().describe("Defaults to 'claude'. Use 'generic' to force generic body."),
+    },
+  },
+  async ({ slug, vendor }) => {
+    try {
+      const v = vendor ?? "claude";
+      const { data: skill, error } = await supabase
+        .from("skills").select("id, generic_body, name, description, tags").eq("slug", slug).maybeSingle();
+      if (error) {
+        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      }
+      if (!skill) {
+        return { content: [{ type: "text" as const, text: `Skill not found: ${slug}` }], isError: true };
+      }
+      if (v === "generic") {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ slug, name: skill.name, source: "generic", body: skill.generic_body }) }] };
+      }
+      const { data: variant } = await supabase
+        .from("skill_variants").select("body, mode").eq("skill_id", skill.id).eq("vendor", v).maybeSingle();
+      let body = skill.generic_body;
+      let source = "generic";
+      if (variant) {
+        if (variant.mode === "replace") { body = variant.body; source = `variant:${v}:replace`; }
+        else if (variant.mode === "extend") { body = `${skill.generic_body}\n\n${variant.body}`; source = `variant:${v}:extend`; }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ slug, name: skill.name, source, body }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "skill_upsert",
+  {
+    title: "Upsert Skill",
+    description:
+      "Create or update a skill by slug. Pass generic_body. Tags optional.",
+    inputSchema: {
+      slug: z.string(),
+      name: z.string(),
+      description: z.string(),
+      generic_body: z.string(),
+      tags: z.array(z.string()).optional(),
+    },
+  },
+  async ({ slug, name, description, generic_body, tags }) => {
+    try {
+      const { data, error } = await supabase
+        .from("skills")
+        .upsert({ slug, name, description, generic_body, tags: tags ?? [] }, { onConflict: "slug" })
+        .select("id, slug, version, updated_at")
+        .single();
+      if (error) {
+        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {
