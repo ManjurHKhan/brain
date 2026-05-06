@@ -145,9 +145,16 @@ def main():
                     help="Process only the first N files (for testing)")
     ap.add_argument("--workers", type=int, default=4,
                     help="Concurrent capture_thought calls (default 4)")
+    ap.add_argument("--paths", nargs="+",
+                    help="Process only these specific paths (for retrying errored files). "
+                         "Bypasses ROOTS walk; accepts ~ expansion.")
     args = ap.parse_args()
 
-    files = list(find_files())
+    if args.paths:
+        files = [Path(p).expanduser().resolve() for p in args.paths]
+        files = [p for p in files if p.exists()]
+    else:
+        files = list(find_files())
     if args.limit:
         files = files[: args.limit]
 

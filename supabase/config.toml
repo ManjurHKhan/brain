@@ -380,6 +380,14 @@ deno_version = 2
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 
+# Per-function deploy config. The mcp function does its own auth via x-brain-key
+# header (see lib/auth.ts); JWT verification at the gateway would block that path
+# before our handler ever runs. Without this block, `supabase functions deploy mcp`
+# defaults to verify_jwt=true and breaks all clients until redeployed with
+# --no-verify-jwt.
+[functions.mcp]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 54327
