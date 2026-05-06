@@ -6,3 +6,4 @@ vendor/OB1-snapshot/
 node_modules/
 dist/
 .supabase/
+.security-scan/
