@@ -1044,6 +1044,326 @@ server.registerTool(
   }
 );
 
+// --- Comms / Sessions / Outputs tools (added 2026-05-07) ---
+
+const COMM_TYPES = ["call", "email", "slack", "meeting", "dm", "text", "other"] as const;
+const SESSION_STATUSES = ["active", "ended", "archived"] as const;
+const OUTPUT_KINDS = ["runbook", "report", "rfi", "rfp", "plan", "memo", "analysis", "quote", "other"] as const;
+
+async function fingerprint(text: string): Promise<string> {
+  // Match upsert_thought() server-side fingerprint: sha256(lower(trimmed normalized whitespace))
+  const normalized = text.trim().toLowerCase().replace(/\s+/g, " ");
+  const buf = new TextEncoder().encode(normalized);
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+server.registerTool(
+  "comm_log",
+  {
+    title: "Log a Communication",
+    description:
+      "Record a call/email/slack/meeting/dm/text. Idempotent: re-logging the same summary+body updates the existing row instead of duplicating. Contacts is a free-text array; identity resolution is deferred.",
+    inputSchema: {
+      occurred_at: z.string().describe("ISO timestamp"),
+      comm_type: z.enum(COMM_TYPES),
+      summary: z.string(),
+      body: z.string().optional(),
+      platform: z.string().optional(),
+      duration_min: z.number().optional(),
+      key_decisions: z.string().optional(),
+      technical_insights: z.string().optional(),
+      contacts: z.array(z.string()).optional(),
+      source_file: z.string().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const fp = await fingerprint(`${args.summary}\n${args.body ?? ""}`);
+      const row: Record<string, unknown> = { ...args, contacts: args.contacts ?? [], content_fingerprint: fp };
+      // Partial unique index can't be used as ON CONFLICT target — do an explicit lookup then insert-or-update
+      const { data: existing } = await supabase.from("comms").select("id").eq("content_fingerprint", fp).maybeSingle();
+      if (existing) {
+        const { data, error } = await supabase.from("comms").update(row).eq("id", existing.id).select().single();
+        if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, occurred_at: data.occurred_at, comm_type: data.comm_type, deduped: true }) }] };
+      }
+      const { data, error } = await supabase.from("comms").insert(row).select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, occurred_at: data.occurred_at, comm_type: data.comm_type, deduped: false }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "comm_list",
+  {
+    title: "List Comms",
+    description: "List comms with optional filters. `contact` matches any name in the contacts[] array.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      comm_type: z.enum(COMM_TYPES).optional(),
+      contact: z.string().optional().describe("Match a single contact name in the contacts[] array"),
+      since: z.string().optional().describe("ISO timestamp; only comms after this time"),
+      limit: z.number().optional().default(50),
+    },
+  },
+  async ({ comm_type, contact, since, limit }) => {
+    try {
+      let q = supabase.from("comms").select("id, occurred_at, comm_type, platform, summary, contacts, key_decisions, source_file");
+      if (comm_type) q = q.eq("comm_type", comm_type);
+      if (contact) q = q.contains("contacts", [contact]);
+      if (since) q = q.gte("occurred_at", since);
+      q = q.order("occurred_at", { ascending: false }).limit(limit);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data ?? [], null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "comm_get",
+  {
+    title: "Get Comm",
+    description: "Fetch a single comm by id, including body + technical_insights.",
+    annotations: { readOnlyHint: true },
+    inputSchema: { id: z.string().uuid() },
+  },
+  async ({ id }) => {
+    try {
+      const { data, error } = await supabase.from("comms")
+        .select("id, occurred_at, comm_type, platform, duration_min, summary, body, key_decisions, technical_insights, contacts, source_file, metadata, created_at, updated_at")
+        .eq("id", id).maybeSingle();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      if (!data) return { content: [{ type: "text" as const, text: `Comm not found: ${id}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "session_start",
+  {
+    title: "Start a Session",
+    description:
+      "Open a session row. session_id is the wrapper id like 'c-20260507-123456-01'. Idempotent on session_id — re-calling updates title/project of an existing active session.",
+    inputSchema: {
+      session_id: z.string(),
+      title: z.string().optional(),
+      project: z.string().optional().describe("'GRC'|'INFRA'|'DEV'|'personal'|other"),
+      claude_uuid: z.string().optional(),
+      started_at: z.string().optional().describe("ISO timestamp; defaults to now"),
+    },
+  },
+  async ({ session_id, title, project, claude_uuid, started_at }) => {
+    try {
+      const insert = {
+        session_id, title, project, claude_uuid,
+        started_at: started_at ?? new Date().toISOString(),
+        status: "active",
+      };
+      const { data, error } = await supabase.from("sessions")
+        .upsert(insert, { onConflict: "session_id" })
+        .select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, session_id: data.session_id, status: data.status, started_at: data.started_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "session_end",
+  {
+    title: "End a Session",
+    description:
+      "Close a session: set ended_at, status='ended', and fill the structured slices (accomplishments, decisions, open_items, next_steps). Pass body for the full markdown log; fingerprint dedups against re-runs.",
+    inputSchema: {
+      session_id: z.string(),
+      body: z.string().optional(),
+      accomplishments: z.array(z.string()).optional(),
+      decisions: z.array(z.string()).optional(),
+      open_items: z.array(z.string()).optional(),
+      next_steps: z.array(z.string()).optional(),
+      files_modified: z.array(z.string()).optional(),
+      ended_at: z.string().optional().describe("ISO timestamp; defaults to now"),
+    },
+  },
+  async (args) => {
+    try {
+      const { session_id, body, ...slices } = args;
+      const fp = body ? await fingerprint(body) : null;
+      const patch: Record<string, unknown> = {
+        ...slices,
+        body,
+        ended_at: args.ended_at ?? new Date().toISOString(),
+        status: "ended",
+        content_fingerprint: fp,
+      };
+      const { data, error } = await supabase.from("sessions")
+        .update(patch).eq("session_id", session_id)
+        .select().single();
+      if (error) {
+        // Maybe row doesn't exist yet — accept that and create on the fly
+        const { data: created, error: insertErr } = await supabase.from("sessions")
+          .insert({ session_id, started_at: new Date().toISOString(), ...patch })
+          .select().single();
+        if (insertErr) return { content: [{ type: "text" as const, text: `Error: ${insertErr.message}` }], isError: true };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ id: created.id, session_id: created.session_id, status: created.status }) }] };
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, session_id: data.session_id, status: data.status, ended_at: data.ended_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "session_get",
+  {
+    title: "Get Session",
+    description: "Fetch a session by session_id (wrapper id) or row id.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      session_id: z.string().optional(),
+      id: z.string().uuid().optional(),
+    },
+  },
+  async ({ session_id, id }) => {
+    try {
+      let q = supabase.from("sessions").select("*");
+      if (id) q = q.eq("id", id);
+      else if (session_id) q = q.eq("session_id", session_id);
+      else return { content: [{ type: "text" as const, text: "Provide either session_id or id" }], isError: true };
+      const { data, error } = await q.maybeSingle();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      if (!data) return { content: [{ type: "text" as const, text: "Session not found" }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "session_list",
+  {
+    title: "List Sessions",
+    description: "List sessions filtered by project/status/date.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      project: z.string().optional(),
+      status: z.enum(SESSION_STATUSES).optional(),
+      since: z.string().optional().describe("ISO timestamp; only sessions started after this"),
+      limit: z.number().optional().default(20),
+    },
+  },
+  async ({ project, status, since, limit }) => {
+    try {
+      let q = supabase.from("sessions").select("id, session_id, title, project, status, started_at, ended_at, accomplishments, next_steps");
+      if (project) q = q.eq("project", project);
+      if (status) q = q.eq("status", status);
+      if (since) q = q.gte("started_at", since);
+      q = q.order("started_at", { ascending: false }).limit(limit);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data ?? [], null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "output_register",
+  {
+    title: "Register an Output",
+    description:
+      "Record a deliverable in the typed outputs index. The body of the output (if markdown) should also be captured to thoughts via capture_thought for semantic search; this table is the typed lookup.",
+    inputSchema: {
+      filename: z.string(),
+      description: z.string(),
+      title: z.string().optional(),
+      kind: z.enum(OUTPUT_KINDS).optional(),
+      project: z.string().optional(),
+      related_issue_code: z.string().optional(),
+      recipient: z.string().optional(),
+      source_file: z.string().optional(),
+      file_id: z.string().uuid().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const { data, error } = await supabase.from("outputs").insert(args).select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, filename: data.filename, kind: data.kind, registered_at: data.registered_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "output_list",
+  {
+    title: "List Outputs",
+    description: "List registered deliverables filtered by project/kind/recipient/issue.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      project: z.string().optional(),
+      kind: z.enum(OUTPUT_KINDS).optional(),
+      recipient: z.string().optional(),
+      related_issue_code: z.string().optional(),
+      since: z.string().optional().describe("ISO timestamp"),
+      limit: z.number().optional().default(50),
+    },
+  },
+  async ({ project, kind, recipient, related_issue_code, since, limit }) => {
+    try {
+      let q = supabase.from("outputs").select("id, filename, title, kind, project, related_issue_code, recipient, description, registered_at");
+      if (project) q = q.eq("project", project);
+      if (kind) q = q.eq("kind", kind);
+      if (recipient) q = q.eq("recipient", recipient);
+      if (related_issue_code) q = q.eq("related_issue_code", related_issue_code);
+      if (since) q = q.gte("registered_at", since);
+      q = q.order("registered_at", { ascending: false }).limit(limit);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data ?? [], null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "output_get",
+  {
+    title: "Get Output",
+    description: "Fetch an output row by id.",
+    annotations: { readOnlyHint: true },
+    inputSchema: { id: z.string().uuid() },
+  },
+  async ({ id }) => {
+    try {
+      const { data, error } = await supabase.from("outputs").select("*").eq("id", id).maybeSingle();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      if (!data) return { content: [{ type: "text" as const, text: `Output not found: ${id}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {
