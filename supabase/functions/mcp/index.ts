@@ -661,12 +661,42 @@ const ISSUE_STATUSES = ["backlog", "in-progress", "review", "blocked", "done", "
 const ISSUE_TYPES = ["task", "bug", "epic", "spike", "research", "chore"] as const;
 const PRIORITIES = ["low", "medium", "high", "critical"] as const;
 
+// Optimistic concurrency: if `expected_updated_at` doesn't match current, return stale shape.
+// If it matches at read-time but loses the race against another writer, the guarded update
+// affects 0 rows; we re-read and still return the stale shape so callers always get a clear
+// retry signal rather than a generic Postgres error. (Codex P1.5)
+type ConcurrencyResult<T> = { ok: T } | { stale: T | null };
+
+async function guardedUpdate<T extends { id: string; updated_at: string }>(
+  table: string,
+  current: T,
+  expected_updated_at: string,
+  patch: Record<string, unknown>
+): Promise<ConcurrencyResult<T>> {
+  if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
+    return { stale: current };
+  }
+  const { data, error } = await supabase.from(table)
+    .update(patch).eq("id", current.id).eq("updated_at", current.updated_at)
+    .select().maybeSingle();
+  if (error) throw error;
+  if (!data) {
+    const { data: fresh } = await supabase.from(table).select("*").eq("id", current.id).maybeSingle();
+    return { stale: (fresh as T | null) };
+  }
+  return { ok: data as T };
+}
+
+function staleResponse(stale: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current: stale }) }] };
+}
+
 server.registerTool(
   "issue_create",
   {
     title: "Create Issue",
     description:
-      "Create an issue. Codes are user-supplied (e.g., 'INFRA-058'); uniqueness enforced on (project_slug, code).",
+      "Create an issue. Codes are user-supplied (e.g., 'INFRA-058') and globally unique. Schema check constraint enforces `code like project_slug || '-%'`.",
     inputSchema: {
       project_slug: z.string().describe("'INFRA' | 'GRC' | 'DEV' | 'PERS' | 'MANJUR'"),
       code: z.string().describe("Full issue code, e.g. 'INFRA-058'"),
@@ -732,15 +762,9 @@ server.registerTool(
         .from("issues").select("*").eq("code", code).maybeSingle();
       if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
       if (!current) return { content: [{ type: "text" as const, text: `Issue not found: ${code}` }], isError: true };
-      // Compare ISO timestamps as strings; Postgres returns microsecond precision so normalize.
-      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
-      }
-      const { data, error } = await supabase.from("issues")
-        .update(patch).eq("id", current.id).eq("updated_at", current.updated_at)
-        .select().single();
-      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-      // Status transition history
+      const result = await guardedUpdate("issues", current, expected_updated_at, patch);
+      if ("stale" in result) return staleResponse(result.stale);
+      const data = result.ok;
       const newStatus = patch.status as string | undefined;
       if (newStatus && newStatus !== current.status) {
         await supabase.from("issue_status_history").insert({
@@ -852,13 +876,9 @@ server.registerTool(
         .from("issues").select("*").eq("code", code).maybeSingle();
       if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
       if (!current) return { content: [{ type: "text" as const, text: `Issue not found: ${code}` }], isError: true };
-      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
-      }
-      const { data, error } = await supabase.from("issues")
-        .update({ status: to_status }).eq("id", current.id).eq("updated_at", current.updated_at)
-        .select().single();
-      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      const result = await guardedUpdate("issues", current, expected_updated_at, { status: to_status });
+      if ("stale" in result) return staleResponse(result.stale);
+      const data = result.ok;
       if (to_status !== current.status) {
         await supabase.from("issue_status_history").insert({
           issue_id: current.id, from_status: current.status, to_status, changed_by: "mcp",
@@ -930,18 +950,12 @@ server.registerTool(
         .from("todos").select("*").eq("id", id).maybeSingle();
       if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
       if (!current) return { content: [{ type: "text" as const, text: `Todo not found: ${id}` }], isError: true };
-      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
-      }
-      // Auto-stamp completed_at when transitioning to done
       if (patch.status === "done" && !patch.completed_at && !current.completed_at) {
         patch.completed_at = new Date().toISOString();
       }
-      const { data, error } = await supabase.from("todos")
-        .update(patch).eq("id", id).eq("updated_at", current.updated_at)
-        .select().single();
-      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+      const result = await guardedUpdate("todos", current, expected_updated_at, patch);
+      if ("stale" in result) return staleResponse(result.stale);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result.ok) }] };
     } catch (err: unknown) {
       return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
@@ -997,15 +1011,11 @@ server.registerTool(
         .from("todos").select("*").eq("id", id).maybeSingle();
       if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
       if (!current) return { content: [{ type: "text" as const, text: `Todo not found: ${id}` }], isError: true };
-      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
-      }
-      const { data, error } = await supabase.from("todos")
-        .update({ status: "done", completed_at: new Date().toISOString() })
-        .eq("id", id).eq("updated_at", current.updated_at)
-        .select().single();
-      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+      const result = await guardedUpdate("todos", current, expected_updated_at, {
+        status: "done", completed_at: new Date().toISOString(),
+      });
+      if ("stale" in result) return staleResponse(result.stale);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result.ok) }] };
     } catch (err: unknown) {
       return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
@@ -1030,14 +1040,9 @@ server.registerTool(
         .from("todos").select("*").eq("id", id).maybeSingle();
       if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
       if (!current) return { content: [{ type: "text" as const, text: `Todo not found: ${id}` }], isError: true };
-      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
-      }
-      const { data, error } = await supabase.from("todos")
-        .update({ assignee }).eq("id", id).eq("updated_at", current.updated_at)
-        .select().single();
-      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+      const result = await guardedUpdate("todos", current, expected_updated_at, { assignee });
+      if ("stale" in result) return staleResponse(result.stale);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result.ok) }] };
     } catch (err: unknown) {
       return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
@@ -1063,7 +1068,7 @@ server.registerTool(
   {
     title: "Log a Communication",
     description:
-      "Record a call/email/slack/meeting/dm/text. Idempotent: re-logging the same summary+body updates the existing row instead of duplicating. Contacts is a free-text array; identity resolution is deferred.",
+      "Record a call/email/slack/meeting/dm/text. Idempotent via fingerprint: a re-log with the same source_file (or, if no source_file, the same occurred_at + type + platform + sorted contacts + summary + body) updates the existing row. Atomic — uses upsert_comm RPC with ON CONFLICT.",
     inputSchema: {
       occurred_at: z.string().describe("ISO timestamp"),
       comm_type: z.enum(COMM_TYPES),
@@ -1074,23 +1079,41 @@ server.registerTool(
       key_decisions: z.string().optional(),
       technical_insights: z.string().optional(),
       contacts: z.array(z.string()).optional(),
-      source_file: z.string().optional(),
+      source_file: z.string().optional().describe("If provided, used as the dedup key directly"),
     },
   },
   async (args) => {
     try {
-      const fp = await fingerprint(`${args.summary}\n${args.body ?? ""}`);
-      const row: Record<string, unknown> = { ...args, contacts: args.contacts ?? [], content_fingerprint: fp };
-      // Partial unique index can't be used as ON CONFLICT target — do an explicit lookup then insert-or-update
-      const { data: existing } = await supabase.from("comms").select("id").eq("content_fingerprint", fp).maybeSingle();
-      if (existing) {
-        const { data, error } = await supabase.from("comms").update(row).eq("id", existing.id).select().single();
-        if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-        return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, occurred_at: data.occurred_at, comm_type: data.comm_type, deduped: true }) }] };
-      }
-      const { data, error } = await supabase.from("comms").insert(row).select().single();
+      // Fingerprint: source_file is the primary import key. Fall back to a structural
+      // tuple so two distinct calls with identical summary but different metadata don't
+      // collide. (Codex P1.3)
+      const fpInput = args.source_file
+        ? `src:${args.source_file}`
+        : [
+            args.occurred_at,
+            args.comm_type,
+            args.platform ?? "",
+            (args.contacts ?? []).slice().sort().join("|"),
+            args.summary,
+            args.body ?? "",
+          ].join("");
+      const fp = await fingerprint(fpInput);
+      const payload = {
+        occurred_at: args.occurred_at,
+        comm_type: args.comm_type,
+        platform: args.platform ?? null,
+        duration_min: args.duration_min ?? null,
+        summary: args.summary,
+        body: args.body ?? null,
+        key_decisions: args.key_decisions ?? null,
+        technical_insights: args.technical_insights ?? null,
+        contacts: args.contacts ?? [],
+        source_file: args.source_file ?? null,
+        content_fingerprint: fp,
+      };
+      const { data, error } = await supabase.rpc("upsert_comm", { p_row: payload });
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, occurred_at: data.occurred_at, comm_type: data.comm_type, deduped: false }) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
     } catch (err: unknown) {
       return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
@@ -1164,16 +1187,16 @@ server.registerTool(
   },
   async ({ session_id, title, project, claude_uuid, started_at }) => {
     try {
-      const insert = {
-        session_id, title, project, claude_uuid,
-        started_at: started_at ?? new Date().toISOString(),
-        status: "active",
-      };
-      const { data, error } = await supabase.from("sessions")
-        .upsert(insert, { onConflict: "session_id" })
-        .select().single();
+      // Use server-side RPC: preserves existing started_at on retries (Codex P1.6).
+      const { data, error } = await supabase.rpc("session_start", {
+        p_session_id: session_id,
+        p_title: title ?? null,
+        p_project: project ?? null,
+        p_claude_uuid: claude_uuid ?? null,
+        p_started_at: started_at ?? null,
+      });
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
-      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, session_id: data.session_id, status: data.status, started_at: data.started_at }) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
     } catch (err: unknown) {
       return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
@@ -1208,16 +1231,17 @@ server.registerTool(
         status: "ended",
         content_fingerprint: fp,
       };
+      // Try update first; only fall back to insert when no row matched (not on any error). (Codex P1.6)
       const { data, error } = await supabase.from("sessions")
         .update(patch).eq("session_id", session_id)
-        .select().single();
-      if (error) {
-        // Maybe row doesn't exist yet — accept that and create on the fly
+        .select().maybeSingle();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      if (!data) {
         const { data: created, error: insertErr } = await supabase.from("sessions")
           .insert({ session_id, started_at: new Date().toISOString(), ...patch })
           .select().single();
         if (insertErr) return { content: [{ type: "text" as const, text: `Error: ${insertErr.message}` }], isError: true };
-        return { content: [{ type: "text" as const, text: JSON.stringify({ id: created.id, session_id: created.session_id, status: created.status }) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ id: created.id, session_id: created.session_id, status: created.status, ended_at: created.ended_at }) }] };
       }
       return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, session_id: data.session_id, status: data.status, ended_at: data.ended_at }) }] };
     } catch (err: unknown) {
