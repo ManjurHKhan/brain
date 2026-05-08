@@ -1087,16 +1087,19 @@ server.registerTool(
       // Fingerprint: source_file is the primary import key. Fall back to a structural
       // tuple so two distinct calls with identical summary but different metadata don't
       // collide. (Codex P1.3)
+      // Normalize occurred_at to UTC ISO so the same instant in different timezones
+      // produces the same fingerprint. (Codex round-2 P2)
+      const occurredUTC = new Date(args.occurred_at).toISOString();
       const fpInput = args.source_file
         ? `src:${args.source_file}`
         : [
-            args.occurred_at,
+            occurredUTC,
             args.comm_type,
             args.platform ?? "",
             (args.contacts ?? []).slice().sort().join("|"),
             args.summary,
             args.body ?? "",
-          ].join("");
+          ].join("|");
       const fp = await fingerprint(fpInput);
       const payload = {
         occurred_at: args.occurred_at,
