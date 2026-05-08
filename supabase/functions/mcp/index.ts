@@ -655,6 +655,395 @@ server.registerTool(
   }
 );
 
+// --- Issues tools (added 2026-05-07) ---
+
+const ISSUE_STATUSES = ["backlog", "in-progress", "review", "blocked", "done", "wontfix"] as const;
+const ISSUE_TYPES = ["task", "bug", "epic", "spike", "research", "chore"] as const;
+const PRIORITIES = ["low", "medium", "high", "critical"] as const;
+
+server.registerTool(
+  "issue_create",
+  {
+    title: "Create Issue",
+    description:
+      "Create an issue. Codes are user-supplied (e.g., 'INFRA-058'); uniqueness enforced on (project_slug, code).",
+    inputSchema: {
+      project_slug: z.string().describe("'INFRA' | 'GRC' | 'DEV' | 'PERS' | 'MANJUR'"),
+      code: z.string().describe("Full issue code, e.g. 'INFRA-058'"),
+      title: z.string(),
+      body: z.string().optional(),
+      type: z.enum(ISSUE_TYPES).optional(),
+      status: z.enum(ISSUE_STATUSES).optional(),
+      priority: z.enum(PRIORITIES).optional(),
+      assignee: z.string().optional(),
+      effort_hours: z.number().optional(),
+      due_date: z.string().optional().describe("YYYY-MM-DD"),
+      parent_code: z.string().optional(),
+      controls: z.array(z.string()).optional(),
+      tags: z.array(z.string()).optional(),
+      jira_key: z.string().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const insert: Record<string, unknown> = { ...args };
+      if (!insert.controls) insert.controls = [];
+      if (!insert.tags) insert.tags = [];
+      const { data, error } = await supabase.from("issues").insert(insert).select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      // Seed status history
+      await supabase.from("issue_status_history").insert({
+        issue_id: data.id, from_status: null, to_status: data.status, changed_by: "mcp",
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, code: data.code, status: data.status, updated_at: data.updated_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "issue_update",
+  {
+    title: "Update Issue",
+    description:
+      "Patch an issue. Pass `expected_updated_at` from the row you read — if it doesn't match the current value, the call returns {error:'stale', current:<row>} and you should re-read and retry.",
+    inputSchema: {
+      code: z.string(),
+      expected_updated_at: z.string().describe("ISO timestamp; optimistic concurrency token"),
+      title: z.string().optional(),
+      body: z.string().optional(),
+      type: z.enum(ISSUE_TYPES).optional(),
+      status: z.enum(ISSUE_STATUSES).optional(),
+      priority: z.enum(PRIORITIES).optional(),
+      assignee: z.string().nullable().optional(),
+      effort_hours: z.number().nullable().optional(),
+      due_date: z.string().nullable().optional(),
+      parent_code: z.string().nullable().optional(),
+      controls: z.array(z.string()).optional(),
+      tags: z.array(z.string()).optional(),
+      jira_key: z.string().nullable().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const { code, expected_updated_at, ...patch } = args as Record<string, unknown> & { code: string; expected_updated_at: string };
+      const { data: current, error: readErr } = await supabase
+        .from("issues").select("*").eq("code", code).maybeSingle();
+      if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
+      if (!current) return { content: [{ type: "text" as const, text: `Issue not found: ${code}` }], isError: true };
+      // Compare ISO timestamps as strings; Postgres returns microsecond precision so normalize.
+      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
+      }
+      const { data, error } = await supabase.from("issues")
+        .update(patch).eq("id", current.id).eq("updated_at", current.updated_at)
+        .select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      // Status transition history
+      const newStatus = patch.status as string | undefined;
+      if (newStatus && newStatus !== current.status) {
+        await supabase.from("issue_status_history").insert({
+          issue_id: current.id, from_status: current.status, to_status: newStatus, changed_by: "mcp",
+        });
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, code: data.code, status: data.status, updated_at: data.updated_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "issue_get",
+  {
+    title: "Get Issue",
+    description: "Fetch a single issue by code, including all comments and status history.",
+    annotations: { readOnlyHint: true },
+    inputSchema: { code: z.string() },
+  },
+  async ({ code }) => {
+    try {
+      const { data, error } = await supabase
+        .from("issues")
+        .select("*, issue_comments (id, body, author, created_at), issue_status_history (id, from_status, to_status, changed_by, changed_at)")
+        .eq("code", code).maybeSingle();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      if (!data) return { content: [{ type: "text" as const, text: `Issue not found: ${code}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "issue_list",
+  {
+    title: "List Issues",
+    description: "List issues with optional filters. Returns code/title/status/priority/assignee/updated_at — call issue_get for full detail.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      project_slug: z.string().optional(),
+      status: z.enum(ISSUE_STATUSES).optional(),
+      assignee: z.string().optional(),
+      tag: z.string().optional().describe("Single tag to filter by"),
+      limit: z.number().optional().default(50),
+    },
+  },
+  async ({ project_slug, status, assignee, tag, limit }) => {
+    try {
+      let q = supabase.from("issues").select("code, project_slug, title, type, status, priority, assignee, due_date, tags, updated_at");
+      if (project_slug) q = q.eq("project_slug", project_slug);
+      if (status) q = q.eq("status", status);
+      if (assignee) q = q.eq("assignee", assignee);
+      if (tag) q = q.contains("tags", [tag]);
+      q = q.order("updated_at", { ascending: false }).limit(limit);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data ?? [], null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "issue_comment",
+  {
+    title: "Comment on Issue",
+    description: "Add a comment to an issue.",
+    inputSchema: {
+      code: z.string(),
+      body: z.string(),
+      author: z.string().optional(),
+    },
+  },
+  async ({ code, body, author }) => {
+    try {
+      const { data: issue, error: lookupErr } = await supabase
+        .from("issues").select("id").eq("code", code).maybeSingle();
+      if (lookupErr) return { content: [{ type: "text" as const, text: `Error: ${lookupErr.message}` }], isError: true };
+      if (!issue) return { content: [{ type: "text" as const, text: `Issue not found: ${code}` }], isError: true };
+      const { data, error } = await supabase
+        .from("issue_comments").insert({ issue_id: issue.id, body, author }).select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "issue_transition",
+  {
+    title: "Transition Issue Status",
+    description: "Move an issue to a new status. Convenience wrapper over issue_update; requires expected_updated_at for optimistic concurrency.",
+    inputSchema: {
+      code: z.string(),
+      to_status: z.enum(ISSUE_STATUSES),
+      expected_updated_at: z.string(),
+    },
+  },
+  async ({ code, to_status, expected_updated_at }) => {
+    try {
+      const { data: current, error: readErr } = await supabase
+        .from("issues").select("*").eq("code", code).maybeSingle();
+      if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
+      if (!current) return { content: [{ type: "text" as const, text: `Issue not found: ${code}` }], isError: true };
+      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
+      }
+      const { data, error } = await supabase.from("issues")
+        .update({ status: to_status }).eq("id", current.id).eq("updated_at", current.updated_at)
+        .select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      if (to_status !== current.status) {
+        await supabase.from("issue_status_history").insert({
+          issue_id: current.id, from_status: current.status, to_status, changed_by: "mcp",
+        });
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ code: data.code, status: data.status, updated_at: data.updated_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// --- Todos tools (added 2026-05-07) ---
+
+const TODO_STATUSES = ["open", "in-progress", "waiting", "done", "cancelled"] as const;
+
+server.registerTool(
+  "todo_create",
+  {
+    title: "Create Todo",
+    description:
+      "Create a todo. `assignee` is the conventional vendor identifier ('manjur' | 'claude-code' | 'codex' | 'gemini' | 'mobile') or NULL for unassigned. `created_by` is stamped automatically; do not supply.",
+    inputSchema: {
+      content: z.string(),
+      assignee: z.string().optional(),
+      priority: z.enum(PRIORITIES).optional(),
+      context: z.string().optional().describe("Free-text grouping like project/area"),
+      tags: z.array(z.string()).optional(),
+      due_at: z.string().optional().describe("ISO timestamp"),
+      comm_id: z.string().uuid().optional().describe("Link to a comm if this todo is an action item"),
+    },
+  },
+  async (args) => {
+    try {
+      // For now the shared MCP key doesn't tell us which vendor called; left blank until per-client keys land.
+      const insert: Record<string, unknown> = { ...args, tags: args.tags ?? [] };
+      const { data, error } = await supabase.from("todos").insert(insert).select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: data.id, status: data.status, assignee: data.assignee, updated_at: data.updated_at }) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "todo_update",
+  {
+    title: "Update Todo",
+    description:
+      "Patch a todo with optimistic concurrency. Returns {error:'stale', current:<row>} if expected_updated_at is wrong.",
+    inputSchema: {
+      id: z.string().uuid(),
+      expected_updated_at: z.string(),
+      content: z.string().optional(),
+      status: z.enum(TODO_STATUSES).optional(),
+      assignee: z.string().nullable().optional(),
+      priority: z.enum(PRIORITIES).optional(),
+      context: z.string().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+      due_at: z.string().nullable().optional(),
+      completed_at: z.string().nullable().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const { id, expected_updated_at, ...patch } = args as Record<string, unknown> & { id: string; expected_updated_at: string };
+      const { data: current, error: readErr } = await supabase
+        .from("todos").select("*").eq("id", id).maybeSingle();
+      if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
+      if (!current) return { content: [{ type: "text" as const, text: `Todo not found: ${id}` }], isError: true };
+      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
+      }
+      // Auto-stamp completed_at when transitioning to done
+      if (patch.status === "done" && !patch.completed_at && !current.completed_at) {
+        patch.completed_at = new Date().toISOString();
+      }
+      const { data, error } = await supabase.from("todos")
+        .update(patch).eq("id", id).eq("updated_at", current.updated_at)
+        .select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "todo_list",
+  {
+    title: "List Todos",
+    description:
+      "List todos with optional filters. Use `assignee` to pick up work targeted at a specific vendor (codex, claude-code, etc.).",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      status: z.enum(TODO_STATUSES).optional(),
+      assignee: z.string().optional().describe("'manjur'|'claude-code'|'codex'|'gemini'|'mobile' or any string. Use 'unassigned' to filter for NULL."),
+      context: z.string().optional(),
+      tag: z.string().optional(),
+      limit: z.number().optional().default(50),
+    },
+  },
+  async ({ status, assignee, context, tag, limit }) => {
+    try {
+      let q = supabase.from("todos").select("id, content, status, assignee, priority, context, tags, due_at, completed_at, created_at, updated_at");
+      if (status) q = q.eq("status", status);
+      if (assignee === "unassigned") q = q.is("assignee", null);
+      else if (assignee) q = q.eq("assignee", assignee);
+      if (context) q = q.eq("context", context);
+      if (tag) q = q.contains("tags", [tag]);
+      q = q.order("created_at", { ascending: false }).limit(limit);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data ?? [], null, 2) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "todo_done",
+  {
+    title: "Mark Todo Done",
+    description: "Convenience wrapper: set status='done' and stamp completed_at=now(). Requires expected_updated_at.",
+    inputSchema: {
+      id: z.string().uuid(),
+      expected_updated_at: z.string(),
+    },
+  },
+  async ({ id, expected_updated_at }) => {
+    try {
+      const { data: current, error: readErr } = await supabase
+        .from("todos").select("*").eq("id", id).maybeSingle();
+      if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
+      if (!current) return { content: [{ type: "text" as const, text: `Todo not found: ${id}` }], isError: true };
+      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
+      }
+      const { data, error } = await supabase.from("todos")
+        .update({ status: "done", completed_at: new Date().toISOString() })
+        .eq("id", id).eq("updated_at", current.updated_at)
+        .select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "todo_assign",
+  {
+    title: "Assign Todo to a Vendor",
+    description:
+      "Hand off a todo to a different vendor (or to `manjur` for human pickup). Conventionally 'manjur'|'claude-code'|'codex'|'gemini'|'mobile'. Pass null to unassign.",
+    inputSchema: {
+      id: z.string().uuid(),
+      assignee: z.string().nullable(),
+      expected_updated_at: z.string(),
+    },
+  },
+  async ({ id, assignee, expected_updated_at }) => {
+    try {
+      const { data: current, error: readErr } = await supabase
+        .from("todos").select("*").eq("id", id).maybeSingle();
+      if (readErr) return { content: [{ type: "text" as const, text: `Error: ${readErr.message}` }], isError: true };
+      if (!current) return { content: [{ type: "text" as const, text: `Todo not found: ${id}` }], isError: true };
+      if (new Date(current.updated_at).toISOString() !== new Date(expected_updated_at).toISOString()) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "stale", current }) }] };
+      }
+      const { data, error } = await supabase.from("todos")
+        .update({ assignee }).eq("id", id).eq("updated_at", current.updated_at)
+        .select().single();
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {
