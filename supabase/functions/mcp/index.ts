@@ -1089,17 +1089,19 @@ server.registerTool(
       // collide. (Codex P1.3)
       // Normalize occurred_at to UTC ISO so the same instant in different timezones
       // produces the same fingerprint. (Codex round-2 P2)
+      // Use JSON.stringify so user content containing delimiter chars cannot smear
+      // field boundaries. (Codex round-3 P2)
       const occurredUTC = new Date(args.occurred_at).toISOString();
       const fpInput = args.source_file
         ? `src:${args.source_file}`
-        : [
+        : JSON.stringify([
             occurredUTC,
             args.comm_type,
             args.platform ?? "",
-            (args.contacts ?? []).slice().sort().join("|"),
+            (args.contacts ?? []).slice().sort(),
             args.summary,
             args.body ?? "",
-          ].join("|");
+          ]);
       const fp = await fingerprint(fpInput);
       const payload = {
         occurred_at: args.occurred_at,
